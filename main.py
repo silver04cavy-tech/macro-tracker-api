@@ -3,9 +3,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlmodel import Field, SQLModel, Session, create_engine, select
 from passlib.context import CryptContext
+from google import genai
+from google.genai import types
+from PIL import Image
 import jwt
 from datetime import datetime, timedelta
 import os
+import io
+import json
 
 # --- DATABASE SETUP ---
 DATABASE_URL = os.getenv(
@@ -67,6 +72,10 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+# --- GEMINI CLIENT INIT ---
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
 # --- FASTAPI APP SETUP ---
 app = FastAPI(title="Macro Tracker API")
 
@@ -118,7 +127,7 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), ses
     access_token = create_access_token(data={"sub": user.username})
     return {"access_token": access_token, "token_type": "bearer"}
 
-# --- MEAL LOGGING ROUTES ---
+# --- AI MEAL LOGGING ROUTE ---
 @app.post("/log-meal")
 async def log_meal(
     description: str = Form(""),
@@ -126,17 +135,67 @@ async def log_meal(
     current_user: str = Depends(get_current_user),
     session: Session = Depends(get_session)
 ):
-    meal_desc = description if description else "Uploaded Meal Photo"
-    cals, protein, carbs, fats = 450, 35, 40, 15
+    if not description and not file:
+        raise HTTPException(status_code=400, detail="Please provide a photo or text description.")
+
+    meal_description = description if description else "Logged Meal"
+    cals, protein, carbs, fats = 300, 20, 30, 10
+
+    if ai_client:
+        try:
+            prompt = """
+            Analyze this meal from the provided text description and/or image.
+            Estimate the total nutritional values for the entire portion.
+            Return ONLY a valid JSON object with these exact keys:
+            {
+                "description": "Short name/summary of the food items",
+                "calories": integer,
+                "protein": integer (grams),
+                "carbs": integer (grams),
+                "fats": integer (grams)
+            }
+            Do not include any markdown formatting, backticks, or extra text.
+            """
+
+            contents = [prompt]
+
+            if description:
+                contents.append(f"User description: {description}")
+
+            if file:
+                image_bytes = await file.read()
+                pil_image = Image.open(io.BytesIO(image_bytes))
+                contents.append(pil_image)
+
+            response = ai_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                )
+            )
+
+            ai_data = json.loads(response.text)
+            meal_description = ai_data.get("description", meal_description)
+            cals = int(ai_data.get("calories", cals))
+            protein = int(ai_data.get("protein", protein))
+            carbs = int(ai_data.get("carbs", carbs))
+            fats = int(ai_data.get("fats", fats))
+
+        except Exception as e:
+            print(f"Gemini API Error: {e}")
+            if description:
+                meal_description = description
 
     new_meal = Meal(
         username=current_user,
-        description=meal_desc,
+        description=meal_description,
         calories=cals,
         protein=protein,
         carbs=carbs,
         fats=fats
     )
+
     session.add(new_meal)
     session.commit()
     session.refresh(new_meal)

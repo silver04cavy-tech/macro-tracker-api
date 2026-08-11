@@ -24,6 +24,10 @@ class User(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     username: str = Field(index=True, unique=True)
     hashed_password: str
+    target_calories: int = Field(default=2000)
+    target_protein: int = Field(default=150)
+    target_carbs: int = Field(default=200)
+    target_fats: int = Field(default=65)
 
 class Meal(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
@@ -127,6 +131,35 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), ses
     access_token = create_access_token(data={"sub": user.username})
     return {"access_token": access_token, "token_type": "bearer"}
 
+# --- USER GOALS ROUTES ---
+@app.get("/user/goals")
+def get_user_goals(current_user: str = Depends(get_current_user), session: Session = Depends(get_session)):
+    user = session.exec(select(User).where(User.username == current_user)).first()
+    if not user:
+        raise HTTPException(status_code=44, detail="User not found")
+    return {
+        "calories": user.target_calories,
+        "protein": user.target_protein,
+        "carbs": user.target_carbs,
+        "fats": user.target_fats
+    }
+
+@app.put("/user/goals")
+def update_user_goals(goals_data: dict, current_user: str = Depends(get_current_user), session: Session = Depends(get_session)):
+    user = session.exec(select(User).where(User.username == current_user)).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.target_calories = int(goals_data.get("calories", user.target_calories))
+    user.target_protein = int(goals_data.get("protein", user.target_protein))
+    user.target_carbs = int(goals_data.get("carbs", user.target_carbs))
+    user.target_fats = int(goals_data.get("fats", user.target_fats))
+
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    return {"message": "Goals updated successfully"}
+
 # --- AI MEAL LOGGING ROUTE ---
 @app.post("/log-meal")
 async def log_meal(
@@ -206,3 +239,19 @@ async def log_meal(
 def get_meals(current_user: str = Depends(get_current_user), session: Session = Depends(get_session)):
     meals = session.exec(select(Meal).where(Meal.username == current_user)).all()
     return meals
+
+@app.delete("/meals/{meal_id}")
+def delete_meal(
+    meal_id: int,
+    current_user: str = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    meal = session.get(Meal, meal_id)
+    if not meal:
+        raise HTTPException(status_code=404, detail="Meal not found")
+    if meal.username != current_user:
+        raise HTTPException(status_code=403, detail="Not authorized to delete this meal")
+
+    session.delete(meal)
+    session.commit()
+    return {"message": "Meal deleted successfully"}

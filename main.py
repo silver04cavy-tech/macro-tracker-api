@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, F
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlmodel import Field, SQLModel, Session, create_engine, select
+from sqlalchemy import text
 from passlib.context import CryptContext
 from google import genai
 from google.genai import types
@@ -49,6 +50,22 @@ class Meal(SQLModel, table=True):
 
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
+    
+    # Auto-add missing columns to existing user table
+    columns = [
+        ("target_calories", "INTEGER DEFAULT 2000"),
+        ("target_protein", "INTEGER DEFAULT 150"),
+        ("target_carbs", "INTEGER DEFAULT 200"),
+        ("target_fats", "INTEGER DEFAULT 65")
+    ]
+    
+    with engine.connect() as conn:
+        for col_name, col_type in columns:
+            try:
+                conn.execute(text(f'ALTER TABLE "user" ADD COLUMN IF NOT EXISTS {col_name} {col_type};'))
+                conn.commit()
+            except Exception as e:
+                print(f"Migration notice for {col_name}: {e}")
 
 def get_session():
     with Session(engine) as session:

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlmodel import Field, SQLModel, Session, create_engine, select
@@ -7,19 +7,27 @@ from google import genai
 from google.genai import types
 from PIL import Image
 import jwt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import os
 import io
 import json
+import urllib.request
 
-# --- DATABASE SETUP ---
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://neondb_owner:npg_4pMkoHfaeSt8@ep-patient-mouse-aypszbto.c-5.us-east-2.aws.neon.tech/neondb?sslmode=require"
-)
+# --- ENVIRONMENT CONFIG ---
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is not set.")
 
-engine = create_engine(DATABASE_URL, echo=True)
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY environment variable is not set.")
 
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
+
+engine = create_engine(DATABASE_URL, echo=False)
+
+# --- MODELS ---
 class User(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     username: str = Field(index=True, unique=True)
@@ -46,11 +54,7 @@ def get_session():
     with Session(engine) as session:
         yield session
 
-# --- SECURITY & AUTH CONFIG ---
-SECRET_KEY = os.getenv("SECRET_KEY", "super-secret-key-change-in-production")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
-
+# --- AUTH CONFIG ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
@@ -80,7 +84,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-# --- FASTAPI APP SETUP ---
+# --- FASTAPI APP ---
 app = FastAPI(title="Macro Tracker API")
 
 app.add_middleware(
@@ -136,7 +140,7 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), ses
 def get_user_goals(current_user: str = Depends(get_current_user), session: Session = Depends(get_session)):
     user = session.exec(select(User).where(User.username == current_user)).first()
     if not user:
-        raise HTTPException(status_code=44, detail="User not found")
+        raise HTTPException(status_code=404, detail="User not found")
     return {
         "calories": user.target_calories,
         "protein": user.target_protein,
@@ -160,7 +164,7 @@ def update_user_goals(goals_data: dict, current_user: str = Depends(get_current_
     session.refresh(user)
     return {"message": "Goals updated successfully"}
 
-# --- AI MEAL LOGGING ROUTE ---
+# --- MEAL ROUTES ---
 @app.post("/log-meal")
 async def log_meal(
     description: str = Form(""),
@@ -191,10 +195,8 @@ async def log_meal(
             """
 
             contents = [prompt]
-
             if description:
                 contents.append(f"User description: {description}")
-
             if file:
                 image_bytes = await file.read()
                 pil_image = Image.open(io.BytesIO(image_bytes))
@@ -203,9 +205,7 @@ async def log_meal(
             response = ai_client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=contents,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json"
-                )
+                config=types.GenerateContentConfig(response_mime_type="application/json")
             )
 
             ai_data = json.loads(response.text)
@@ -232,13 +232,116 @@ async def log_meal(
     session.add(new_meal)
     session.commit()
     session.refresh(new_meal)
-
     return {"message": "Meal logged successfully", "meal": new_meal}
 
+@app.post("/log-meal-manual")
+def log_meal_manual(
+    meal_data: dict,
+    current_user: str = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    desc = meal_data.get("description", "Manual Meal")
+    cals = int(meal_data.get("calories", 0))
+    prot = int(meal_data.get("protein", 0))
+    carbs = int(meal_data.get("carbs", 0))
+    fats = int(meal_data.get("fats", 0))
+
+    new_meal = Meal(
+        username=current_user,
+        description=desc,
+        calories=cals,
+        protein=prot,
+        carbs=carbs,
+        fats=fats
+    )
+
+    session.add(new_meal)
+    session.commit()
+    session.refresh(new_meal)
+    return {"message": "Manual meal logged", "meal": new_meal}
+
+@app.get("/barcode/{code}")
+def get_barcode_data(code: str, current_user: str = Depends(get_current_user)):
+    url = f"https://world.openfoodfacts.org/api/v2/product/{code}.json"
+    req = urllib.request.Request(
+        url, 
+        headers={"User-Agent": "MacroTrackerApp/1.0 (test@macrotracker.local)"}
+    )
+    
+    try:
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode())
+            
+        if data.get("status") != 1:
+            raise HTTPException(status_code=404, detail="Product not found in database.")
+            
+        product = data.get("product", {})
+        nutriments = product.get("nutriments", {})
+        name = product.get("product_name", f"Barcode Item ({code})")
+        
+        calories = int(round(float(nutriments.get("energy-kcal_serving") or nutriments.get("energy-kcal_100g") or 0)))
+        protein = int(round(float(nutriments.get("proteins_serving") or nutriments.get("proteins_100g") or 0)))
+        carbs = int(round(float(nutriments.get("carbohydrates_serving") or nutriments.get("carbohydrates_100g") or 0)))
+        fats = int(round(float(nutriments.get("fat_serving") or nutriments.get("fat_100g") or 0)))
+        
+        return {
+            "description": name,
+            "calories": calories,
+            "protein": protein,
+            "carbs": carbs,
+            "fats": fats
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch product: {str(e)}")
+
 @app.get("/meals")
-def get_meals(current_user: str = Depends(get_current_user), session: Session = Depends(get_session)):
-    meals = session.exec(select(Meal).where(Meal.username == current_user)).all()
+def get_meals(
+    selected_date: str | None = Query(None),
+    current_user: str = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    query = select(Meal).where(Meal.username == current_user)
+    
+    if selected_date:
+        try:
+            target_dt = date.fromisoformat(selected_date)
+            start_dt = datetime.combine(target_dt, datetime.min.time())
+            end_dt = datetime.combine(target_dt, datetime.max.time())
+            query = query.where(Meal.timestamp >= start_dt).where(Meal.timestamp <= end_dt)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    meals = session.exec(query.order_by(Meal.timestamp.desc())).all()
     return meals
+
+@app.get("/meals/export")
+def export_meals(current_user: str = Depends(get_current_user), session: Session = Depends(get_session)):
+    meals = session.exec(select(Meal).where(Meal.username == current_user).order_by(Meal.timestamp.asc())).all()
+    return meals
+
+@app.put("/meals/{meal_id}")
+def update_meal(
+    meal_id: int,
+    meal_data: dict,
+    current_user: str = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    meal = session.get(Meal, meal_id)
+    if not meal:
+        raise HTTPException(status_code=404, detail="Meal not found")
+    if meal.username != current_user:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    meal.description = meal_data.get("description", meal.description)
+    meal.calories = int(meal_data.get("calories", meal.calories))
+    meal.protein = int(meal_data.get("protein", meal.protein))
+    meal.carbs = int(meal_data.get("carbs", meal.carbs))
+    meal.fats = int(meal_data.get("fats", meal.fats))
+
+    session.add(meal)
+    session.commit()
+    session.refresh(meal)
+    return {"message": "Meal updated", "meal": meal}
 
 @app.delete("/meals/{meal_id}")
 def delete_meal(
@@ -250,7 +353,7 @@ def delete_meal(
     if not meal:
         raise HTTPException(status_code=404, detail="Meal not found")
     if meal.username != current_user:
-        raise HTTPException(status_code=403, detail="Not authorized to delete this meal")
+        raise HTTPException(status_code=403, detail="Not authorized")
 
     session.delete(meal)
     session.commit()
